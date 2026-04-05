@@ -17,6 +17,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 _DEFAULT_STORE_FILENAME = "user_profiles.json"
 _PBKDF2_ITERATIONS = 200_000
@@ -116,6 +117,86 @@ def _normalise_profile(profile: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _profile_signature(profile: dict[str, Any]) -> str:
+    normalised = _normalise_profile(profile)
+    return json.dumps(normalised, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _empty_notification_state() -> dict[str, Any]:
+    return {
+        "matched_scheme_ids": [],
+        "items": [],
+        "last_checked_at": "",
+        "last_emailed_at": "",
+        "profile_signature": "",
+    }
+
+
+def _normalise_matching_schemes(matching_schemes: list[dict[str, Any]]) -> list[dict[str, str]]:
+    seen: set[str] = set()
+    normalised: list[dict[str, str]] = []
+    for match in matching_schemes:
+        scheme_id = str(match.get("scheme_id") or "").strip()
+        scheme_name = str(match.get("scheme_name") or "").strip()
+        key = scheme_id or scheme_name
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        normalised.append({
+            "scheme_id": scheme_id,
+            "scheme_name": scheme_name or scheme_id,
+        })
+    return normalised
+
+
+def _normalise_notification_items(items: Any) -> list[dict[str, str]]:
+    if not isinstance(items, list):
+        return []
+
+    normalised: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        notification_id = str(item.get("notification_id") or uuid4().hex)
+        if notification_id in seen:
+            continue
+        seen.add(notification_id)
+        normalised.append({
+            "notification_id": notification_id,
+            "scheme_id": str(item.get("scheme_id") or "").strip(),
+            "scheme_name": str(item.get("scheme_name") or item.get("scheme_id") or "").strip(),
+            "detected_at": str(item.get("detected_at") or "").strip(),
+            "message": str(item.get("message") or "").strip(),
+            "email_sent_at": str(item.get("email_sent_at") or "").strip(),
+        })
+    return normalised
+
+
+def _normalise_notification_state(state: Any) -> dict[str, Any]:
+    if not isinstance(state, dict):
+        return _empty_notification_state()
+
+    return {
+        "matched_scheme_ids": [
+            str(value).strip()
+            for value in state.get("matched_scheme_ids", [])
+            if str(value).strip()
+        ],
+        "items": _normalise_notification_items(state.get("items", [])),
+        "last_checked_at": str(state.get("last_checked_at") or "").strip(),
+        "last_emailed_at": str(state.get("last_emailed_at") or "").strip(),
+        "profile_signature": str(state.get("profile_signature") or "").strip(),
+    }
+
+
+def _email_notifications_enabled(record: dict[str, Any]) -> bool:
+    value = record.get("email_notifications_enabled")
+    if value is None:
+        return bool(str(record.get("email") or "").strip())
+    return bool(value)
+
+
 class UserStore:
     """Small JSON-backed user store for login + saved search profiles."""
 
@@ -154,13 +235,22 @@ class UserStore:
         os.replace(temp_name, self._path)
 
     def _public_user(self, record: dict[str, Any]) -> dict[str, Any]:
+        notification_state = _normalise_notification_state(record.get("notification_state"))
+        pending_email_notifications = [
+            item for item in notification_state["items"] if not item.get("email_sent_at")
+        ]
         return {
             "login_id": record["login_id"],
             "full_name": record.get("full_name", ""),
             "email": record.get("email", ""),
             "phone": record.get("phone", ""),
             "preferred_language": record.get("preferred_language", "en"),
+            "email_notifications_enabled": _email_notifications_enabled(record),
             "profile": record.get("profile", {}),
+            "notifications": notification_state.get("items", []),
+            "notification_last_checked_at": notification_state.get("last_checked_at", ""),
+            "pending_email_notifications": len(pending_email_notifications),
+            "email_notifications_last_sent_at": notification_state.get("last_emailed_at", ""),
             "created_at": record.get("created_at", ""),
             "updated_at": record.get("updated_at", ""),
         }
@@ -174,6 +264,7 @@ class UserStore:
         email: str = "",
         phone: str = "",
         preferred_language: str = "en",
+        email_notifications_enabled: bool | None = None,
     ) -> dict[str, Any]:
         login_id = login_id.strip()
         if not login_id:
@@ -190,7 +281,12 @@ class UserStore:
             "email": email.strip(),
             "phone": phone.strip(),
             "preferred_language": preferred_language.strip() or "en",
+            "email_notifications_enabled": (
+                bool(email.strip()) if email_notifications_enabled is None
+                else bool(email_notifications_enabled)
+            ),
             "profile": {},
+            "notification_state": _empty_notification_state(),
             "password_salt": base64.b64encode(salt).decode("ascii"),
             "password_hash": _hash_password(password, salt),
             "created_at": now,
@@ -231,6 +327,12 @@ class UserStore:
             record = payload["users"].get(key)
         return self._public_user(record) if record else None
 
+    def list_users(self) -> list[dict[str, Any]]:
+        with self._lock:
+            payload = self._read()
+            records = list(payload["users"].values())
+        return [self._public_user(record) for record in records]
+
     def save_profile(
         self,
         login_id: str,
@@ -240,6 +342,7 @@ class UserStore:
         full_name: str | None = None,
         email: str | None = None,
         phone: str | None = None,
+        email_notifications_enabled: bool | None = None,
     ) -> dict[str, Any]:
         key = _normalise_login_id(login_id)
         if not key:
@@ -251,7 +354,11 @@ class UserStore:
             if not record:
                 raise ValueError("User not found.")
 
-            record["profile"] = _normalise_profile(profile)
+            normalised_profile = _normalise_profile(profile)
+            if record.get("profile", {}) != normalised_profile:
+                # Reset tracking when the saved eligibility profile changes.
+                record["notification_state"] = _empty_notification_state()
+            record["profile"] = normalised_profile
             if preferred_language is not None:
                 record["preferred_language"] = preferred_language.strip() or "en"
             if full_name is not None:
@@ -260,9 +367,149 @@ class UserStore:
                 record["email"] = email.strip()
             if phone is not None:
                 record["phone"] = phone.strip()
+            if email_notifications_enabled is not None:
+                record["email_notifications_enabled"] = bool(email_notifications_enabled)
+            elif "email_notifications_enabled" not in record:
+                record["email_notifications_enabled"] = bool(record.get("email", "").strip())
             record["updated_at"] = _utc_now()
 
             payload["users"][key] = record
             self._write(payload)
 
         return self._public_user(record)
+
+    def get_pending_email_notifications(self, login_id: str) -> list[dict[str, Any]]:
+        key = _normalise_login_id(login_id)
+        if not key:
+            raise ValueError("Login ID is required.")
+
+        with self._lock:
+            payload = self._read()
+            record = payload["users"].get(key)
+            if not record:
+                raise ValueError("User not found.")
+
+            notification_state = _normalise_notification_state(record.get("notification_state"))
+            record["notification_state"] = notification_state
+            payload["users"][key] = record
+            self._write(payload)
+
+        return [
+            dict(item)
+            for item in notification_state["items"]
+            if not item.get("email_sent_at")
+        ]
+
+    def mark_notifications_emailed(
+        self,
+        login_id: str,
+        notification_ids: list[str],
+    ) -> dict[str, Any]:
+        key = _normalise_login_id(login_id)
+        if not key:
+            raise ValueError("Login ID is required.")
+
+        ids_to_mark = {str(notification_id).strip() for notification_id in notification_ids if str(notification_id).strip()}
+        if not ids_to_mark:
+            return self.get_user(login_id) or {}
+
+        with self._lock:
+            payload = self._read()
+            record = payload["users"].get(key)
+            if not record:
+                raise ValueError("User not found.")
+
+            notification_state = _normalise_notification_state(record.get("notification_state"))
+            emailed_at = _utc_now()
+            updated_any = False
+            for item in notification_state["items"]:
+                if item["notification_id"] in ids_to_mark and not item.get("email_sent_at"):
+                    item["email_sent_at"] = emailed_at
+                    updated_any = True
+            if updated_any:
+                notification_state["last_emailed_at"] = emailed_at
+                record["notification_state"] = notification_state
+                record["updated_at"] = emailed_at
+                payload["users"][key] = record
+                self._write(payload)
+
+        return self.get_user(login_id) or {}
+
+    def refresh_notifications(
+        self,
+        login_id: str,
+        matching_schemes: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        key = _normalise_login_id(login_id)
+        if not key:
+            raise ValueError("Login ID is required.")
+
+        now = _utc_now()
+
+        with self._lock:
+            payload = self._read()
+            record = payload["users"].get(key)
+            if not record:
+                raise ValueError("User not found.")
+
+            normalised_profile = _normalise_profile(record.get("profile") or {})
+            if not all(
+                normalised_profile.get(field) not in ("", None)
+                for field in ("state", "category", "income", "gender", "age", "education")
+            ):
+                raise ValueError("Save a complete profile before checking notifications.")
+
+            notification_state = _normalise_notification_state(record.get("notification_state"))
+
+            normalised_matches = _normalise_matching_schemes(matching_schemes)
+            current_ids = [match["scheme_id"] or match["scheme_name"] for match in normalised_matches]
+            current_signature = _profile_signature(normalised_profile)
+
+            baseline_reset = (
+                notification_state.get("profile_signature") != current_signature
+                or not notification_state.get("last_checked_at")
+            )
+            new_notifications: list[dict[str, str]] = []
+
+            if baseline_reset:
+                notification_state = _empty_notification_state()
+                notification_state["matched_scheme_ids"] = current_ids
+                notification_state["profile_signature"] = current_signature
+                notification_state["last_checked_at"] = now
+            else:
+                existing_ids = set(notification_state.get("matched_scheme_ids", []))
+                existing_items = notification_state.get("items", [])
+                if not isinstance(existing_items, list):
+                    existing_items = []
+
+                for match in normalised_matches:
+                    match_id = match["scheme_id"] or match["scheme_name"]
+                    if match_id in existing_ids:
+                        continue
+                    new_notifications.append({
+                        "notification_id": uuid4().hex,
+                        "scheme_id": match["scheme_id"],
+                        "scheme_name": match["scheme_name"],
+                        "detected_at": now,
+                        "message": (
+                            f"New matching scholarship found: {match['scheme_name']}"
+                        ),
+                        "email_sent_at": "",
+                    })
+
+                notification_state["items"] = (new_notifications + existing_items)[:50]
+                notification_state["matched_scheme_ids"] = current_ids
+                notification_state["profile_signature"] = current_signature
+                notification_state["last_checked_at"] = now
+
+            record["notification_state"] = notification_state
+            record["updated_at"] = now
+            payload["users"][key] = record
+            self._write(payload)
+
+        return {
+            "user": self._public_user(record),
+            "new_notifications": new_notifications,
+            "new_count": len(new_notifications),
+            "baseline_reset": baseline_reset,
+        }

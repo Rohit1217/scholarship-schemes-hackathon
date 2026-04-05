@@ -49,6 +49,12 @@ from scholarship.llm_client import (
     extract_assistant_text,
     rag_user_message,
 )
+from scholarship.notification_service import process_user_email_notifications
+from scholarship.profile_matching import (
+    matching_schemes_for_profile as _shared_matching_schemes_for_profile,
+    profile_to_query as _shared_profile_to_query,
+    saved_profile_complete as _shared_saved_profile_complete,
+)
 from scholarship.retriever import DatabricksVSRetriever, Retriever, get_retriever
 from scholarship.sarvam_client import (
     is_configured as sarvam_configured,
@@ -164,6 +170,7 @@ def get_runtime() -> RAGRuntime:
 def get_user_store() -> UserStore:
     global _user_store
     if _user_store is None:
+        logger.info("Initializing user store lazily on first account action.")
         _user_store = UserStore()
     return _user_store
 
@@ -182,23 +189,16 @@ def profile_to_query(
     disability: bool,
     minority: bool,
 ) -> str:
-    income_lakh = income / 100_000
-    income_lakh_str = (
-        f"{int(income_lakh)} lakh" if income_lakh == int(income_lakh)
-        else f"{income_lakh:.2f} lakh"
+    return _shared_profile_to_query(
+        state,
+        category,
+        income,
+        gender,
+        age,
+        education,
+        disability,
+        minority,
     )
-    parts = [
-        f"I am a {int(age)}-year-old {gender} student from {state}.",
-        f"My category is {category}.",
-        f"My annual family income is \u20b9{income_lakh_str} (i.e. \u20b9{int(income):,}).",
-        f"I am currently studying at {education} level.",
-    ]
-    if disability:
-        parts.append("I have a disability.")
-    if minority:
-        parts.append("I belong to a minority community.")
-    parts.append("Which scholarship schemes am I eligible for?")
-    return " ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +405,11 @@ def _user_summary_markdown(user: dict[str, object] | None) -> str:
     email = str(user.get("email") or "Not provided")
     phone = str(user.get("phone") or "Not provided")
     profile = user.get("profile") or {}
+    notifications = user.get("notifications") or []
+    email_notifications_enabled = bool(user.get("email_notifications_enabled", False))
+    pending_email_notifications = int(user.get("pending_email_notifications") or 0)
+    last_checked = str(user.get("notification_last_checked_at") or "Not yet checked")
+    last_emailed = str(user.get("email_notifications_last_sent_at") or "Not yet sent")
     has_saved_profile = any(
         profile.get(key)
         for key in ("state", "category", "income", "gender", "age", "education")
@@ -415,8 +420,91 @@ def _user_summary_markdown(user: dict[str, object] | None) -> str:
         f"Login ID: `{login_id}`\n\n"
         f"Email: {email}\n\n"
         f"Phone: {phone}\n\n"
-        f"Saved scholarship profile: {'Yes' if has_saved_profile else 'No'}"
+        f"Saved scholarship profile: {'Yes' if has_saved_profile else 'No'}\n\n"
+        f"Email alerts enabled: {'Yes' if email_notifications_enabled else 'No'}\n\n"
+        f"Alerts stored: {len(notifications)}\n\n"
+        f"Pending email alerts: {pending_email_notifications}\n\n"
+        f"Notifications last checked: {last_checked}\n\n"
+        f"Notification emails last sent: {last_emailed}"
     )
+
+
+def _notifications_markdown(user: dict[str, object] | None) -> str:
+    if not user:
+        return ""
+
+    notifications = user.get("notifications") or []
+    last_checked = str(user.get("notification_last_checked_at") or "")
+    if not notifications:
+        lines = [
+            "### New Scholarship Alerts",
+            "",
+            "No new alerts yet.",
+        ]
+        if last_checked:
+            lines.extend(["", f"Last checked: `{last_checked}`"])
+        else:
+            lines.extend([
+                "",
+                "Save your profile and click `Check New Scholarships` to start tracking new matches.",
+            ])
+        return "\n".join(lines)
+
+    lines = ["### New Scholarship Alerts", ""]
+    for notification in notifications[:8]:
+        scheme_name = str(notification.get("scheme_name") or notification.get("scheme_id") or "")
+        scheme_id = str(notification.get("scheme_id") or "")
+        detected_at = str(notification.get("detected_at") or "")
+        email_sent_at = str(notification.get("email_sent_at") or "")
+        suffix = f" (`{scheme_id}`)" if scheme_id else ""
+        date_line = f" - detected `{detected_at}`" if detected_at else ""
+        if email_sent_at:
+            email_line = f" - emailed `{email_sent_at}`"
+        else:
+            email_line = " - email pending"
+        lines.append(f"- {scheme_name}{suffix}{date_line}{email_line}")
+    if len(notifications) > 8:
+        lines.extend(["", f"And {len(notifications) - 8} more stored alert(s)."])
+    if last_checked:
+        lines.extend(["", f"Last checked: `{last_checked}`"])
+    return "\n".join(lines)
+
+
+def _saved_profile_complete(profile: dict[str, object] | None) -> bool:
+    return _shared_saved_profile_complete(profile)
+
+
+def _matching_schemes_for_profile(profile: dict[str, object], *, k: int = 20) -> list[dict[str, str]]:
+    rt = get_runtime()
+    rt.load()
+    return _shared_matching_schemes_for_profile(profile, retriever=rt.retriever, k=k)
+
+
+def _notification_status_text(process_result: dict[str, object]) -> str:
+    refresh_result = process_result["refresh"]
+    email_result = process_result["email"]
+    pending_email_notifications = process_result["pending_email_notifications"]
+    new_count = int(refresh_result["new_count"])
+
+    if refresh_result["baseline_reset"]:
+        return (
+            "*Notification tracking started. Future newly added matching "
+            "scholarships will appear here.*"
+        )
+    if new_count:
+        if email_result["sent"]:
+            return f"*{new_count} new matching scholarship notification(s) found and emailed to you.*"
+        if email_result["message"]:
+            return (
+                f"*{new_count} new matching scholarship notification(s) found. "
+                f"{email_result['message']}*"
+            )
+        return f"*{new_count} new matching scholarship notification(s) found.*"
+    if email_result["sent_count"]:
+        return f"*{email_result['sent_count']} stored scholarship alert(s) were emailed to you.*"
+    if pending_email_notifications and email_result["message"]:
+        return f"*No new matching scholarships since your last check. {email_result['message']}*"
+    return "*No new matching scholarships since your last check.*"
 
 
 # ---------------------------------------------------------------------------
@@ -636,7 +724,11 @@ def build_app() -> gr.Blocks:
 
             with gr.Row():
                 save_profile_btn = gr.Button("Save My Details")
+                check_notifications_btn = gr.Button("Check New Scholarships")
                 find_btn = gr.Button("Find Scholarships · छात्रवृत्ति खोजें", variant="primary")
+
+            notification_status = gr.Markdown(value="", visible=False, elem_classes=["status-card"])
+            notifications_md = gr.Markdown("### New Scholarship Alerts\n\nNo new alerts yet.")
 
             gr.Markdown(
                 "<small>Fill in all fields for best results · "
@@ -682,7 +774,6 @@ def build_app() -> gr.Blocks:
         # ------------------------------------------------------------------
 
         labels = dict(SARVAM_LANGUAGES)
-        user_store = get_user_store()
 
         def _signed_in_view(user, notice: str):
             lang_code = str(user.get("preferred_language") or "en")
@@ -705,6 +796,8 @@ def build_app() -> gr.Blocks:
                 gr.update(value=profile_values[5]),
                 gr.update(value=profile_values[6]),
                 gr.update(value=profile_values[7]),
+                gr.update(value="", visible=False),
+                gr.update(value=_notifications_markdown(user)),
             )
 
         def _signed_out_view(notice: str):
@@ -726,13 +819,15 @@ def build_app() -> gr.Blocks:
                 gr.update(value=None),
                 gr.update(value=False),
                 gr.update(value=False),
+                gr.update(value="", visible=False),
+                gr.update(value="### New Scholarship Alerts\n\nNo new alerts yet."),
             )
 
         def on_register(full_name, login_id, email, phone, password, confirm_password, lang_code):
             if password != confirm_password:
                 return _signed_out_view("**Sign-up failed:** Passwords do not match.")
             try:
-                user = user_store.register_user(
+                user = get_user_store().register_user(
                     login_id,
                     password,
                     full_name=full_name,
@@ -749,7 +844,7 @@ def build_app() -> gr.Blocks:
 
         def on_login(login_id, password):
             try:
-                user = user_store.authenticate_user(login_id, password)
+                user = get_user_store().authenticate_user(login_id, password)
             except Exception as exc:
                 return _signed_out_view(f"**Sign-in failed:** {exc}")
             if not user:
@@ -780,6 +875,8 @@ def build_app() -> gr.Blocks:
                 gr.update(value=None),
                 gr.update(value=False),
                 gr.update(value=False),
+                gr.update(value="", visible=False),
+                gr.update(value="### New Scholarship Alerts\n\nNo new alerts yet."),
                 gr.update(visible=False),
                 gr.update(visible=False, value=[]),
                 gr.update(visible=False),
@@ -805,6 +902,8 @@ def build_app() -> gr.Blocks:
                     current_user,
                     gr.update(),
                     gr.update(value="**Please sign in first.**", visible=True),
+                    gr.update(value="", visible=False),
+                    gr.update(),
                 )
 
             profile = _build_profile_payload(
@@ -819,7 +918,7 @@ def build_app() -> gr.Blocks:
             )
 
             try:
-                updated_user = user_store.save_profile(
+                updated_user = get_user_store().save_profile(
                     current_user["login_id"],
                     profile,
                     preferred_language=lang_code,
@@ -830,12 +929,72 @@ def build_app() -> gr.Blocks:
                     current_user,
                     gr.update(),
                     gr.update(value=f"**Could not save your details:** {exc}", visible=True),
+                    gr.update(value="", visible=False),
+                    gr.update(),
                 )
 
             return (
                 updated_user,
                 gr.update(value=_user_summary_markdown(updated_user)),
                 gr.update(value="*Your profile details have been saved.*", visible=True),
+                gr.update(
+                    value=(
+                        "*Notification tracking was reset for this saved profile. "
+                        "Click `Check New Scholarships` to build a fresh baseline. "
+                        "Any new matches can also be emailed to your saved address when delivery is configured.*"
+                    ),
+                    visible=True,
+                ),
+                gr.update(value=_notifications_markdown(updated_user)),
+            )
+
+        def on_check_notifications(current_user):
+            if not current_user or not current_user.get("login_id"):
+                return (
+                    current_user,
+                    gr.update(),
+                    gr.update(value="**Please sign in first.**", visible=True),
+                    gr.update(),
+                )
+
+            profile = current_user.get("profile") or {}
+            if not _saved_profile_complete(profile):
+                return (
+                    current_user,
+                    gr.update(),
+                    gr.update(
+                        value="**Save a complete profile first before checking new scholarships.**",
+                        visible=True,
+                    ),
+                    gr.update(value=_notifications_markdown(current_user)),
+                )
+
+            try:
+                rt = get_runtime()
+                rt.load()
+                result = process_user_email_notifications(
+                    current_user["login_id"],
+                    user_store=get_user_store(),
+                    retriever=rt.retriever,
+                )
+                updated_user = result["user"]
+            except Exception as exc:
+                logger.exception("on_check_notifications")
+                return (
+                    current_user,
+                    gr.update(),
+                    gr.update(
+                        value=f"**Could not check notifications:** {exc}",
+                        visible=True,
+                    ),
+                    gr.update(value=_notifications_markdown(current_user)),
+                )
+
+            return (
+                updated_user,
+                gr.update(value=_user_summary_markdown(updated_user)),
+                gr.update(value=_notification_status_text(result), visible=True),
+                gr.update(value=_notifications_markdown(updated_user)),
             )
 
         def on_find(
@@ -976,6 +1135,8 @@ def build_app() -> gr.Blocks:
                 edu_radio,
                 disability_cb,
                 minority_cb,
+                notification_status,
+                notifications_md,
             ],
         )
 
@@ -1000,6 +1161,8 @@ def build_app() -> gr.Blocks:
                 edu_radio,
                 disability_cb,
                 minority_cb,
+                notification_status,
+                notifications_md,
             ],
         )
 
@@ -1023,6 +1186,8 @@ def build_app() -> gr.Blocks:
                 edu_radio,
                 disability_cb,
                 minority_cb,
+                notification_status,
+                notifications_md,
                 loading_md,
                 chatbot,
                 tts_row,
@@ -1052,6 +1217,8 @@ def build_app() -> gr.Blocks:
                 edu_radio,
                 disability_cb,
                 minority_cb,
+                notification_status,
+                notifications_md,
                 loading_md,
                 chatbot,
                 tts_row,
@@ -1075,7 +1242,24 @@ def build_app() -> gr.Blocks:
                 disability_cb,
                 minority_cb,
             ],
-            outputs=[current_user_state, account_md, profile_status],
+            outputs=[
+                current_user_state,
+                account_md,
+                profile_status,
+                notification_status,
+                notifications_md,
+            ],
+        )
+
+        check_notifications_btn.click(
+            on_check_notifications,
+            inputs=[current_user_state],
+            outputs=[
+                current_user_state,
+                account_md,
+                notification_status,
+                notifications_md,
+            ],
         )
 
         find_btn.click(
@@ -1194,9 +1378,12 @@ def _load_secrets_from_scope() -> None:
 
 def main() -> None:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+    logger.info("App startup: loading secrets.")
     _load_secrets_from_scope()
+    logger.info("App startup: building Gradio app.")
     demo = build_app()
     demo.queue()
+    logger.info("App startup: launching Gradio server.")
     # Databricks Apps injects GRADIO_SERVER_PORT and GRADIO_ROOT_PATH.
     # server_name must be 0.0.0.0 so the Apps gateway can reach the process.
     demo.launch(

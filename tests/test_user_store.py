@@ -96,3 +96,129 @@ def test_resolve_user_store_path_uses_explicit_path():
     finally:
         if explicit.exists():
             explicit.unlink()
+
+
+def test_refresh_notifications_sets_baseline_then_detects_new_matches():
+    with _store_path() as store_path:
+        store = UserStore(store_path)
+        store.register_user("same-user", "secret123")
+        store.save_profile(
+            "same-user",
+            {
+                "state": "Maharashtra",
+                "category": "OBC",
+                "income": 150000,
+                "gender": "Female",
+                "age": 19,
+                "education": "Undergraduate",
+                "disability": False,
+                "minority": False,
+            },
+        )
+
+        first = store.refresh_notifications(
+            "same-user",
+            [{"scheme_id": "SCH001", "scheme_name": "First Scholarship"}],
+        )
+        second = store.refresh_notifications(
+            "same-user",
+            [
+                {"scheme_id": "SCH001", "scheme_name": "First Scholarship"},
+                {"scheme_id": "SCH002", "scheme_name": "Second Scholarship"},
+            ],
+        )
+
+        assert first["baseline_reset"] is True
+        assert first["new_count"] == 0
+        assert second["baseline_reset"] is False
+        assert second["new_count"] == 1
+        assert second["user"]["notifications"][0]["scheme_id"] == "SCH002"
+        assert second["user"]["notifications"][0]["notification_id"]
+        assert second["user"]["notifications"][0]["email_sent_at"] == ""
+
+
+def test_mark_notifications_emailed_clears_pending_count():
+    with _store_path() as store_path:
+        store = UserStore(store_path)
+        store.register_user("same-user", "secret123", email="student@example.com")
+        store.save_profile(
+            "same-user",
+            {
+                "state": "Maharashtra",
+                "category": "OBC",
+                "income": 150000,
+                "gender": "Female",
+                "age": 19,
+                "education": "Undergraduate",
+                "disability": False,
+                "minority": False,
+            },
+        )
+        store.refresh_notifications(
+            "same-user",
+            [{"scheme_id": "SCH001", "scheme_name": "First Scholarship"}],
+        )
+        store.refresh_notifications(
+            "same-user",
+            [
+                {"scheme_id": "SCH001", "scheme_name": "First Scholarship"},
+                {"scheme_id": "SCH002", "scheme_name": "Second Scholarship"},
+            ],
+        )
+
+        pending = store.get_pending_email_notifications("same-user")
+        updated = store.mark_notifications_emailed(
+            "same-user",
+            [pending[0]["notification_id"]],
+        )
+
+        assert len(pending) == 1
+        assert updated["pending_email_notifications"] == 0
+        assert updated["notifications"][0]["email_sent_at"] != ""
+
+
+def test_save_profile_resets_existing_notification_tracking():
+    with _store_path() as store_path:
+        store = UserStore(store_path)
+        store.register_user("same-user", "secret123")
+        store.save_profile(
+            "same-user",
+            {
+                "state": "Maharashtra",
+                "category": "OBC",
+                "income": 150000,
+                "gender": "Female",
+                "age": 19,
+                "education": "Undergraduate",
+                "disability": False,
+                "minority": False,
+            },
+        )
+        store.refresh_notifications(
+            "same-user",
+            [{"scheme_id": "SCH001", "scheme_name": "First Scholarship"}],
+        )
+        store.refresh_notifications(
+            "same-user",
+            [
+                {"scheme_id": "SCH001", "scheme_name": "First Scholarship"},
+                {"scheme_id": "SCH002", "scheme_name": "Second Scholarship"},
+            ],
+        )
+
+        updated = store.save_profile(
+            "same-user",
+            {
+                "state": "Tamil Nadu",
+                "category": "OBC",
+                "income": 150000,
+                "gender": "Female",
+                "age": 19,
+                "education": "Undergraduate",
+                "disability": False,
+                "minority": False,
+            },
+        )
+
+        assert updated["notifications"] == []
+        assert updated["notification_last_checked_at"] == ""
