@@ -17,11 +17,27 @@ import base64
 import io
 import os
 import re
+import time
 import wave
 from typing import Any
 
 import numpy as np
 import requests
+
+
+def _post_with_retry(url, *, headers, json=None, files=None, data=None, timeout=120, max_retries=3):
+    """POST with exponential backoff on 429 rate-limit responses."""
+    delay = 5
+    for attempt in range(max_retries):
+        r = requests.post(url, headers=headers, json=json, files=files, data=data, timeout=timeout)
+        if r.status_code == 429 and attempt < max_retries - 1:
+            time.sleep(delay)
+            delay *= 2
+            continue
+        r.raise_for_status()
+        return r
+    r.raise_for_status()
+    return r
 
 DEFAULT_CHAT_URL = "https://api.sarvam.ai/v1/chat/completions"
 DEFAULT_MODEL = "sarvam-m"
@@ -109,13 +125,7 @@ def translate_text(
         "source_language_code": source_language_code,
         "target_language_code": target_language_code,
     }
-    r = requests.post(
-        url,
-        headers=_subscription_headers(),
-        json=body,
-        timeout=timeout,
-    )
-    r.raise_for_status()
+    r = _post_with_retry(url, headers=_subscription_headers(), json=body, timeout=timeout)
     data = r.json()
     return _extract_translation_output(data)
 
@@ -144,14 +154,7 @@ def speech_to_text_file(
     data: dict[str, str] = {"model": model, "mode": mode}
     if language_code:
         data["language_code"] = language_code
-    r = requests.post(
-        url,
-        headers=_subscription_headers(json_body=False),
-        files=files,
-        data=data,
-        timeout=timeout,
-    )
-    r.raise_for_status()
+    r = _post_with_retry(url, headers=_subscription_headers(json_body=False), files=files, data=data, timeout=timeout)
     return r.json()
 
 
@@ -180,13 +183,7 @@ def text_to_speech_wav_bytes(
     }
     if speaker:
         body["speaker"] = speaker
-    r = requests.post(
-        url,
-        headers=_subscription_headers(),
-        json=body,
-        timeout=timeout,
-    )
-    r.raise_for_status()
+    r = _post_with_retry(url, headers=_subscription_headers(), json=body, timeout=timeout)
     data = r.json()
     audios = data.get("audios")
     if not audios:
