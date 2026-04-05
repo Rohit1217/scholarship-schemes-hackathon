@@ -1,4 +1,4 @@
-"""Gradio entrypoint: scholarship eligibility RAG + Databricks LLM + Sarvam multilingual."""
+"""Gradio entrypoint: scholarship eligibility RAG + Databricks LLM + Sarvam multilingual ."""
 
 from __future__ import annotations
 
