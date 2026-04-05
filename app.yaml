@@ -1,0 +1,26 @@
+# Databricks Apps runtime — must live at the repository root.
+# https://docs.databricks.com/aws/en/dev-tools/databricks-apps/app-runtime
+#
+# Without this file, Python apps default to: python app.py (this repo uses app/main.py).
+command: ["python", "app/main.py"]
+
+env:
+  # SARVAM_API_KEY is loaded from Databricks secret scope at startup via SDK
+  # (see _load_secrets_from_scope in app/main.py)
+  - name: "LLM_OPENAI_BASE_URL"
+    value: "https://dbc-01321cae-a6a6.cloud.databricks.com/serving-endpoints"
+  - name: "LLM_MODEL"
+    value: "databricks-llama-4-maverick"
+  # Databricks Vector Search — replaces FAISS index files
+  - name: "VS_ENDPOINT_NAME"
+    value: "scholarship-vs-endpoint"
+  - name: "VS_INDEX_NAME"
+    value: "main.scholarships.scheme_vs_index"
+
+secrets:
+  - scope: "scholarship"
+    key: "sarvam_api_key"
+    env_var: "SARVAM_API_KEY"
+  - scope: "scholarship"
+    key: "databricks_token"
+    env_var: "DATABRICKS_TOKEN"
