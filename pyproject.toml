@@ -8,6 +8,7 @@ dependencies = [
   # Align with Databricks Apps template (stable with Gradio 4.44 + huggingface_hub).
   "pandas~=2.2.3",
   "requests>=2.28.0",
+  "mlflow>=2.20,<4",
 ]
 
 [project.optional-dependencies]

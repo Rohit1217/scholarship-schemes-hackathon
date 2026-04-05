@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 # Repo root on Databricks Repos / local clone
@@ -15,6 +16,7 @@ if _SRC.is_dir() and str(_SRC) not in sys.path:
 
 import gradio as gr
 import numpy as np
+import pandas as pd
 
 # ---------- Monkey-patch gradio_client bug (1.3.0 + Gradio 4.44.x) ----------
 # get_api_info() crashes on Chatbot schemas where additionalProperties is True
@@ -49,6 +51,8 @@ from scholarship.llm_client import (
     extract_assistant_text,
     rag_user_message,
 )
+from scholarship.evaluation import evaluate_live_response, evaluation_markdown
+from scholarship.mlflow_tracking import log_search_experiment
 from scholarship.retriever import DatabricksVSRetriever, Retriever, get_retriever
 from scholarship.sarvam_client import (
     is_configured as sarvam_configured,
@@ -250,22 +254,51 @@ def _strip_ineligible_lines(text: str) -> str:
     return "\n".join(kept)
 
 
-def _rag_answer_english(query_en: str) -> tuple[str, str]:
-    """LLM answer in English + citations block."""
+def _rag_answer_run(query_en: str) -> dict[str, object]:
+    """Run retrieval + LLM and return answer, citations, rows, and timings."""
     rt = get_runtime()
     rt.load()
     q = query_en.strip()
+    retrieval_started = time.perf_counter()
     chunks_df = rt.retriever.search(q, k=7)
+    retrieval_latency_ms = (time.perf_counter() - retrieval_started) * 1000
     texts = chunks_df["text"].tolist() if "text" in chunks_df.columns else []
     user_content = rag_user_message([str(t) for t in texts], q)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_content},
     ]
+    llm_started = time.perf_counter()
     raw = chat_completions(messages, max_tokens=2048, temperature=0.2)
+    llm_latency_ms = (time.perf_counter() - llm_started) * 1000
     assistant_en = _strip_ineligible_lines(extract_assistant_text(raw))
     cites = _format_citations(chunks_df)
-    return assistant_en, cites
+    retrieved_rows = [
+        {
+            "scheme_id": str(row.get("scheme_id") or "").strip(),
+            "scheme_name": str(row.get("scheme_name") or "").strip(),
+            "score": float(row.get("score") or 0.0),
+            "rank": int(row.get("rank") or 0),
+        }
+        for _, row in chunks_df.iterrows()
+    ]
+    return {
+        "assistant_en": assistant_en,
+        "citations_markdown": cites,
+        "chunks_df": chunks_df,
+        "retrieved_rows": retrieved_rows,
+        "runtime_metrics": {
+            "retrieval_latency_ms": retrieval_latency_ms,
+            "llm_latency_ms": llm_latency_ms,
+            "total_rag_latency_ms": retrieval_latency_ms + llm_latency_ms,
+        },
+    }
+
+
+def _rag_answer_english(query_en: str) -> tuple[str, str]:
+    """LLM answer in English + citations block."""
+    result = _rag_answer_run(query_en)
+    return str(result["assistant_en"]), str(result["citations_markdown"])
 
 
 # ---------------------------------------------------------------------------
@@ -654,6 +687,7 @@ def build_app() -> gr.Blocks:
             gr.Markdown("### Eligible Schemes · पात्र योजनाएँ")
             current_lang = gr.Markdown("*Language: English*")
             result_banner = gr.Markdown(value="", visible=False, elem_classes=["status-card"])
+            eval_md = gr.Markdown(value="", visible=False, elem_classes=["account-card"])
 
             loading_md = gr.Markdown(
                 "Searching for matching schemes - this may take 10-20 seconds...",
@@ -785,6 +819,7 @@ def build_app() -> gr.Blocks:
                 gr.update(visible=False),
                 None,
                 gr.update(value="", visible=False),
+                gr.update(value="", visible=False),
                 gr.update(value=""),
             )
 
@@ -859,6 +894,7 @@ def build_app() -> gr.Blocks:
                     gr.update(visible=False, value=[]),
                     gr.update(visible=False),
                     None,
+                    gr.update(value="", visible=False),
                     gr.update(),
                     gr.update(value=""),
                     gr.update(value="", visible=False),
@@ -890,6 +926,7 @@ def build_app() -> gr.Blocks:
                     gr.update(visible=False, value=[]),
                     gr.update(visible=False),
                     None,
+                    gr.update(value="", visible=False),
                     gr.update(),
                     gr.update(value=summary),
                     gr.update(value="", visible=False),
@@ -911,6 +948,7 @@ def build_app() -> gr.Blocks:
                 gr.update(visible=False, value=[]),
                 gr.update(visible=False),
                 None,
+                gr.update(value="", visible=False),
                 gr.update(value=f"*Language: {labels.get(lang_code, lang_code)}*"),
                 gr.update(value=summary),
                 gr.update(value="", visible=False),
@@ -924,11 +962,38 @@ def build_app() -> gr.Blocks:
                 query_en = profile_to_query(
                     state, category, income, gender, age, education, disability, minority
                 )
-                assistant_en, cites = _rag_answer_english(query_en)
+                rag_result = _rag_answer_run(query_en)
+                assistant_en = str(rag_result["assistant_en"])
+                cites = str(rag_result["citations_markdown"])
                 reply_md = build_reply_markdown(assistant_en, lang_code)
+                evaluation = evaluate_live_response(
+                    assistant_en=assistant_en,
+                    reply_markdown=reply_md,
+                    lang=lang_code,
+                    chunks_df=rag_result["chunks_df"],
+                    citations_markdown=cites,
+                )
+                eval_panel_md = evaluation_markdown(evaluation)
+                log_search_experiment(
+                    login_id=str(current_user.get("login_id") or ""),
+                    lang=lang_code,
+                    state=state,
+                    category=category,
+                    education=education,
+                    disability=bool(disability),
+                    minority=bool(minority),
+                    income=float(income),
+                    query_en=query_en,
+                    answer_markdown=reply_md,
+                    citations_markdown=cites,
+                    evaluation=evaluation,
+                    runtime_metrics=rag_result["runtime_metrics"],
+                    retrieved_rows=rag_result["retrieved_rows"],
+                )
                 history = [[None, reply_md]]
             except Exception as e:
                 logger.exception("on_find")
+                eval_panel_md = ""
                 history = [[None, f"**Error:** {e}"]]
 
             # ── Yield 2: hide loading, show results ────────────────────────
@@ -939,6 +1004,7 @@ def build_app() -> gr.Blocks:
                 gr.update(visible=True, value=history),         # show chatbot with results
                 gr.update(visible=True),                        # show tts row
                 None,                                           # tts_out
+                gr.update(value=eval_panel_md, visible=bool(eval_panel_md)),
                 gr.update(value=f"*Language: {labels.get(lang_code, lang_code)}*"),
                 gr.update(value=summary),
                 gr.update(value="", visible=False),
@@ -1027,6 +1093,7 @@ def build_app() -> gr.Blocks:
                 chatbot,
                 tts_row,
                 tts_out,
+                eval_md,
                 result_banner,
                 result_account_md,
             ],
@@ -1056,6 +1123,7 @@ def build_app() -> gr.Blocks:
                 chatbot,
                 tts_row,
                 tts_out,
+                eval_md,
                 result_banner,
                 result_account_md,
             ],
@@ -1099,6 +1167,7 @@ def build_app() -> gr.Blocks:
                 chatbot,
                 tts_row,
                 tts_out,
+                eval_md,
                 current_lang,
                 result_account_md,
                 result_banner,
@@ -1137,6 +1206,7 @@ def build_app() -> gr.Blocks:
                 None,
                 gr.update(value="", visible=False),
                 gr.update(value="", visible=False),
+                gr.update(value="", visible=False),
             )
 
         again_btn.click(
@@ -1148,6 +1218,7 @@ def build_app() -> gr.Blocks:
                 chatbot,
                 tts_row,
                 tts_out,
+                eval_md,
                 result_banner,
                 profile_status,
             ],
